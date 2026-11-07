@@ -1,0 +1,21 @@
+# Python environment
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Streamlit / tooling
+.playwright-mcp/
+.streamlit/secrets.toml
+
+# generated output (keep the demo preview)
+sections*.dxf
+!typical_sections.dxf
+sections*.png
+!demo_builtup/preview_full_design_sheet.png
