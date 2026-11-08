@@ -49,6 +49,57 @@ geometry; only `C`, `L` and `R` shots are used.
 With no design levels in the file, the pavement is placed at the surveyed centre line
 (design level = surveyed CL); this is stated on the sheet and in the sidebar.
 
+### Road width vs survey extent
+
+Two different numbers, both labelled on the sheet:
+
+- **formation width** — the design road, `2 × carriageway + 2 × shoulder`
+  (e.g. 10.30 m). This is what the `10.30m` and `1.50 / 3.65 / 3.65 / 1.50` dimensions measure.
+- **survey extent** — the distance between the outermost survey shots
+  (e.g. 12.84 m). It is labelled `... m survey` and is not the road width.
+
+## Use as a library
+
+Calculations are independent of drawing. `compute_section()` returns a
+`SectionResult` containing the ground, formation levels, cut/fill areas, daylight
+points and the internal geometry; drawings and schedules read that same object.
+
+```python
+import xsection as xs
+
+p = xs.Params(carriageway=3.65, shoulder=1.50, camber=2.5, shoulder_fall=5.0)
+
+res = xs.compute_section(
+    chainage=0.0,
+    ground=[(-5.15, 99.83), (0.0, 99.83), (5.15, 99.83)],   # (offset m, level m)
+    design_level=100.0,
+    p=p,
+    built_up=True,
+)
+
+res.formation_width        # 10.30  (the road)
+res.survey_extent          # 10.30  (the shots)
+res.cut_area               # m² to the daylight points
+res.surveyed_cut_area      # m² clipped to surveyed ground
+res.fully_covered          # False when daylight lies beyond the shots
+res.daylight               # {-1: 7.34, 1: 7.34}
+res.table()                # per-shot: offset, ground, formation, cut/fill depth
+xs.section_schedule([res]) # one summary row per section
+
+# draw the same geometry
+doc = xs.survey_doc(df, ground_df, p, show_design=True)
+open("sections.dxf", "wb").write(xs.doc_bytes(doc))
+open("sections.png", "wb").write(xs.render_png(doc))
+```
+
+Other frozen calculation helpers: `formation_width(p)`, `pavement_thickness(p)`,
+`formation_level(offset, design_level, p)`, `stations(start, end, interval, extra=())`.
+
+`SectionResult` fields: `chainage, design_level, formation_width,
+pavement_thickness, ground, formation, cut_area, fill_area, surveyed_cut_area,
+surveyed_fill_area, fully_covered, daylight, cut_polygons, fill_polygons, geometry`.
+
+
 ## Input: Stations / Ground / Parameters
 
 One workbook with sheets `Stations`, `Ground`, `Parameters`, or three CSVs named
@@ -88,7 +139,7 @@ python xsection.py "survey points.csv" --out sections.dxf
 | File | Purpose |
 |---|---|
 | `app.py` | Streamlit UI |
-| `xsection.py` | Parsing, geometry, DXF/PNG rendering, CLI |
+| `xsection.py` | Engine: calculations (`compute_section` → `SectionResult`), DXF/PNG drawing, loading, CLI |
 | `requirements.txt` | `streamlit, ezdxf, pandas, openpyxl, xlrd, matplotlib, numpy` |
 | `demo_builtup.xlsx`, `demo_builtup/` | Test data for the built-up typical sheet |
 | `typical_sections.dxf` | Example output |

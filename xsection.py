@@ -1,9 +1,33 @@
 """
-xsection.py - road cross-section engine (geometry + DXF drawing).
+xsection.py - road cross-section engine (calculations + DXF/PNG drawing).
 
 Units: geometry in metres; DXF drawn in millimetres (x1000).
-Layout of the drawing follows the "TYPICAL ROAD CROSS-SECTION" sheet
-(dimension strings, CL, slopes, layer call-outs, sub-grade note, drains).
+
+Two layers:
+  * calculation  — Params, formation_level, compute_section -> SectionResult.
+                   Pure geometry, no drawing, safe to import from other code.
+  * drawing/IO   — survey_doc / station_doc / typical_doc, render_png, doc_bytes,
+                   load_uploaded, CLI.
+
+Example (calculate a section, then draw or schedule it):
+
+    import xsection as xs
+
+    p = xs.Params(carriageway=3.65, shoulder=1.50)
+    res = xs.compute_section(
+        chainage=0.0,
+        ground=[(-5.15, 99.83), (0.0, 99.83), (5.15, 99.83)],   # (offset, level)
+        design_level=100.0,
+        p=p,
+        built_up=True,
+    )
+    print(res.formation_width)      # 10.3  (the road)
+    print(res.survey_extent)        # 10.3  (the shots)
+    print(res.cut_area, res.fill_area, res.daylight)
+    print(xs.section_schedule([res]))
+
+Drawing and quantity output both read SectionResult; the drawing never
+re-derives geometry of its own.
 """
 from __future__ import annotations
 
@@ -18,6 +42,24 @@ import ezdxf
 import numpy as np
 import pandas as pd
 from ezdxf.enums import TextEntityAlignment as TA
+
+__all__ = [
+    # parameters
+    "Params", "PARAM_NAMES", "params_from_dict",
+    # calculation API
+    "formation_width", "pavement_thickness", "formation_level", "stations",
+    "SectionResult", "compute_section", "section_schedule",
+    # loading
+    "load_uploaded", "load_workbook", "load_csv_files", "survey_points_to_model",
+    "station_points", "parse_chainage", "fmt_chainage", "to_number",
+    # drawings
+    "typical_sections", "typical_doc", "station_section", "station_doc",
+    "survey_doc", "draw_section", "draw_survey_section",
+    "doc_bytes", "render_png",
+    # templates
+    "make_template", "make_csv_template",
+]
+
 
 
 # --------------------------------------------------------------------------
@@ -55,6 +97,171 @@ def params_from_dict(d: dict) -> Params:
         if k in PARAM_NAMES:
             setattr(p, k, type(getattr(p, k))(v))
     return p
+
+
+# --------------------------------------------------------------------------
+# Public calculation API (reusable, no drawing code)
+# --------------------------------------------------------------------------
+def formation_width(p: Params) -> float:
+    """Overall designed platform width, metres (both sides)."""
+    return 2.0 * (p.carriageway + p.shoulder)
+
+
+def pavement_thickness(p: Params) -> float:
+    """Total pavement thickness, metres."""
+    return (p.wearing + p.surface_dressing + p.base + p.subbase) / 1000.0
+
+
+def formation_level(offset: float, design_level: float, p: Params) -> float:
+    """Design surface level at a transverse offset (camber + shoulder fall)."""
+    x = abs(float(offset))
+    c = p.carriageway
+    if x <= c:
+        return design_level - (p.camber / 100.0) * x
+    return (design_level - (p.camber / 100.0) * c
+            - (p.shoulder_fall / 100.0) * (x - c))
+
+
+def stations(start: float, end: float, interval: float, extra=()) -> list[float]:
+    """Section chainages between start and end, including critical stations."""
+    if interval <= 0:
+        raise ValueError("interval must be > 0")
+    if end < start:
+        raise ValueError("end must be >= start")
+    n = int(np.floor((end - start) / interval + 1e-9)) + 1
+    vals = [start + i * interval for i in range(n)]
+    vals += [float(s) for s in extra if start - 1e-9 <= s <= end + 1e-9]
+    return [round(v, 6) for v in sorted(set(round(v, 6) for v in vals))]
+
+
+def _as_points(ground) -> tuple[tuple[float, float], ...]:
+    """Accept [(offset, level), ...] or a DataFrame with Offset/Level columns."""
+    if hasattr(ground, "columns") and {"Offset", "Level"} <= set(ground.columns):
+        pairs = [(o, l) for o, l in zip(ground["Offset"], ground["Level"])]
+    else:
+        pairs = [(o, l) for o, l in ground]
+    return tuple(sorted((float(o), float(l)) for o, l in pairs))
+
+
+@dataclass
+class SectionResult:
+    """Everything calculated for one cross-section — the single source of truth.
+
+    Drawing, schedules, exports and the Earthworks Engine must all read this,
+    never re-derive the geometry from the drawing.
+    """
+    chainage: float
+    design_level: float
+    formation_width: float
+    pavement_thickness: float
+    surveyed: bool
+    built_up: bool
+    ground: tuple[tuple[float, float], ...]        # (offset, level), left -> right
+    formation: tuple[tuple[float, float], ...]     # (offset, design surface level), ±formation width
+    cut_area: float
+    fill_area: float
+    cut_platform: float
+    fill_platform: float
+    surveyed_cut_area: float                     # clipped to the surveyed ground extent
+    surveyed_fill_area: float
+    fully_covered: bool                          # daylight points inside the surveyed extent
+    daylight: dict[int, float]                     # {-1: left offset, +1: right offset}
+    cut_polygons: list
+    fill_polygons: list
+    geometry: dict                                 # full internal geometry (layers, drains, sides)
+
+    @property
+    def survey_extent(self) -> float:
+        """Distance between the outermost surveyed shots (NOT the road width)."""
+        return self.ground[-1][0] - self.ground[0][0]
+
+    def table(self) -> list[dict]:
+        """Per-shot schedule: ground, formation and cut/fill depth."""
+        rows = []
+        for off, lvl in self.ground:
+            inside = abs(off) <= self.formation_width / 2 + 1e-9
+            f = formation_level(off, self.design_level, self.geometry["p"])
+            bottom = f - self.pavement_thickness
+            rows.append({
+                "chainage": self.chainage,
+                "offset": round(off, 3),
+                "ground_level": round(lvl, 3),
+                "formation_level": round(f, 3) if inside else None,
+                "cut_depth": round(max(lvl - bottom, 0.0), 3) if inside else None,
+                "fill_depth": round(max(bottom - lvl, 0.0), 3) if inside else None,
+            })
+        return rows
+
+
+def compute_section(chainage: float, ground, design_level: float, p: Params,
+                    built_up: bool = False, surveyed: bool = True) -> SectionResult:
+    """Calculate one cross-section. Pure geometry; safe to call from other code."""
+    pts = _as_points(ground)
+    if len(pts) < 2:
+        raise ValueError("a cross-section needs at least two ground points")
+    gx = np.array([o for o, _ in pts], float)
+    gy = np.array([l for _, l in pts], float)
+    geo = build_section(float(design_level), gx, gy, p, bool(built_up))
+    geo["p"] = p
+
+    xe = geo["xe"]
+    offs = sorted({-xe, -p.carriageway, 0.0, p.carriageway, xe})
+    formation = tuple((o, formation_level(o, float(design_level), p)) for o in offs)
+
+    # earthworks only count where terrain exists; beyond the shots it is assumed
+    xf, tf, gf = geo["xf"], geo["tf"], geo["gf"]
+    m = (xf >= gx[0] - 1e-9) & (xf <= gx[-1] + 1e-9)
+    if int(m.sum()) > 1:
+        cut_s = float(np.trapezoid(np.clip(gf[m] - tf[m], 0, None), xf[m]))
+        fill_s = float(np.trapezoid(np.clip(tf[m] - gf[m], 0, None), xf[m]))
+    else:
+        cut_s = fill_s = 0.0
+    covered = (geo["dl"] <= -gx[0] + 1e-6) and (geo["dr"] <= gx[-1] + 1e-6)
+
+    return SectionResult(
+        chainage=float(chainage),
+        design_level=float(design_level),
+        formation_width=formation_width(p),
+        pavement_thickness=pavement_thickness(p),
+        surveyed=bool(surveyed),
+        built_up=bool(built_up),
+        ground=pts,
+        formation=formation,
+        cut_area=float(geo["cut"]),
+        fill_area=float(geo["fill"]),
+        cut_platform=float(geo["cut_p"]),
+        fill_platform=float(geo["fill_p"]),
+        surveyed_cut_area=cut_s,
+        surveyed_fill_area=fill_s,
+        fully_covered=bool(covered),
+        daylight={-1: float(geo["dl"]), 1: float(geo["dr"])},
+        cut_polygons=list(geo["cut_polys"]),
+        fill_polygons=list(geo["fill_polys"]),
+        geometry=geo,
+    )
+
+
+def section_schedule(sections) -> list[dict]:
+    """Summary row per section (for CSV/XLSX/JSON and the Earthworks Engine)."""
+    rows = []
+    for s in sections:
+        rows.append({
+            "chainage": s.chainage,
+            "design_level": round(s.design_level, 3),
+            "formation_width": round(s.formation_width, 3),
+            "pavement_thickness": round(s.pavement_thickness, 3),
+            "survey_extent": round(s.survey_extent, 3),
+            "cut_area": round(s.cut_area, 3),
+            "fill_area": round(s.fill_area, 3),
+            "cut_area_surveyed": round(s.surveyed_cut_area, 3),
+            "fill_area_surveyed": round(s.surveyed_fill_area, 3),
+            "fully_covered": s.fully_covered,
+            "daylight_left": round(s.daylight[-1], 3),
+            "daylight_right": round(s.daylight[1], 3),
+            "surveyed": s.surveyed,
+            "built_up": s.built_up,
+        })
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -951,7 +1158,7 @@ def station_points(ch, ground_df):
     return g.sort_values("Offset") if len(g) else None
 
 
-def draw_survey_section(msp, ch, g, p: Params, ox=0.0, oy=0.0, design=None):
+def draw_survey_section(msp, ch, g, p: Params, ox=0.0, oy=0.0, design=None, result=None):
     """Plot the surveyed shots for one station, optionally with the road design
     (pavement box) laid on the same geometry. Returns bottom y (mm)."""
     k = 1000.0
@@ -977,8 +1184,12 @@ def draw_survey_section(msp, ch, g, p: Params, ox=0.0, oy=0.0, design=None):
 
     # ---- road design overlaid on the survey (pavement layers + formation) ----
     sec = None
-    if design is not None and len(offs) > 1:
+    if result is not None:
+        design = float(result.design_level)
+        sec = result.geometry
+    elif design is not None and len(offs) > 1:
         sec = build_section(float(design), offs, lvls, p, False)
+    if sec is not None and len(offs) > 1:
         # cut / fill between formation and surveyed ground, clipped to the survey width
         xa = max(float(offs.min()), -sec["xe"])
         xb = min(float(offs.max()), sec["xe"])
@@ -1071,12 +1282,21 @@ def draw_survey_section(msp, ch, g, p: Params, ox=0.0, oy=0.0, design=None):
         _line(msp, (xc, Y(lo) - 1900), (xc, oy + 1000), "CL", 1)
         _txt(msp, "CL", xc + 170, oy + 980, h * 0.72, TA.MIDDLE_LEFT, "CL", 1)
 
-    # ---- dimension across the surveyed width ----
+    # ---- dimension across the surveyed width (NOT the road width) ----
     if len(offs) > 1:
         ytop = oy + 1500
         yfrom = float(min(Y(lvls[0]), Y(lvls[-1]))) + 200
-        _dim_h(msp, x0_, x1_, ytop, f"{float(offs.max() - offs.min()):.2f}m",
-               h * 1.05, yfrom)
+        _dim_h(msp, x0_, x1_, ytop, f"{float(offs.max() - offs.min()):.2f}m survey",
+               h * 0.95, yfrom)
+
+    # ---- road design dimensions: overall formation + lanes/shoulders ----
+    if sec is not None:
+        c = p.carriageway
+        xe = sec["xe"]
+        yf = Y(float(design)) + 300
+        _dim_h(msp, X(-xe), X(xe), oy + 3150, f"{2 * xe:.2f}m", h * 1.05, yf)
+        for a, b, w in [(-xe, -c, p.shoulder), (-c, 0, c), (0, c, c), (c, xe, p.shoulder)]:
+            _dim_h(msp, X(a), X(b), oy + 2450, f"{w:.2f}m", h * 0.80, yf)
 
     # ---- title block ----
     ybt = Y(lo) - 2500
@@ -1085,15 +1305,16 @@ def draw_survey_section(msp, ch, g, p: Params, ox=0.0, oy=0.0, design=None):
     sub = "(SURVEYED GROUND + ROAD DESIGN)" if sec is not None else "(SURVEYED GROUND)"
     _txt(msp, sub, ox, ybt - h * 2.2, h * 1.15, TA.MIDDLE_CENTER, "TEXT")
     if len(offs) > 1:
-        info = (f"{len(offs)} shots  ·  offsets {offs.min():+.2f} to {offs.max():+.2f} m  ·  "
+        info = (f"{len(offs)} shots  ·  survey extent {offs.max() - offs.min():.2f} m  ·  "
                 f"V.E. ×{p.vexag:g}")
     else:
         info = f"single shot only — no profile  ·  V.E. ×{p.vexag:g}"
     _txt(msp, info, ox, ybt - h * 4.0, h * 0.70, TA.MIDDLE_CENTER, "NOTE")
     if sec is not None:
         t_mm = p.wearing + p.surface_dressing + p.base + p.subbase
-        _txt(msp, f"Road design: CL {float(design):.3f}  ·  {p.carriageway:.2f} m lanes  ·  "
-                  f"{p.shoulder:.2f} m shoulders  ·  {p.camber:.1f}% camber  ·  {t_mm:.0f} mm pavement",
+        _txt(msp, f"Road design: CL {float(design):.3f}  ·  formation {2 * sec['xe']:.2f} m "
+                  f"(2 × {p.carriageway:.2f} lane + 2 × {p.shoulder:.2f} shoulder)  ·  "
+                  f"{p.camber:.1f}% camber  ·  {t_mm:.0f} mm pavement",
              ox, ybt - h * 5.3, h * 0.60, TA.MIDDLE_CENTER, "NOTE")
 
     # ---- shot schedule: everything is measured, nothing assumed ----
@@ -1177,11 +1398,15 @@ def survey_doc(df: pd.DataFrame, ground_df, p: Params, cols=1, show_design=False
     oy, rowbot = 0.0, None
     for i, (r, g) in enumerate(secs):
         if i and i % cols == 0:
-            oy, rowbot = (rowbot if rowbot is not None else oy) - 2800, None
+            oy, rowbot = (rowbot if rowbot is not None else oy) - 3600, None
         design = None
-        if show_design and pd.notna(r.get("Design")):
+        res = None
+        if show_design and pd.notna(r.get("Design")) and g is not None and len(g) > 1:
             design = float(r["Design"])
-        yb = draw_survey_section(msp, r["Chainage"], g, p, (i % cols) * dx, oy, design=design)
+            built = str(r.get("Zone", "")).lower().startswith("b")
+            res = compute_section(r["Chainage"], g, design, p, built_up=built)
+        yb = draw_survey_section(msp, r["Chainage"], g, p, (i % cols) * dx, oy,
+                                 design=design, result=res)
         rowbot = yb if rowbot is None else min(rowbot, yb)
     return doc
 

@@ -131,10 +131,29 @@ with tabs["station"]:
             else:
                 doc2 = xs.survey_doc(sel, ground, p, cols=1, show_design=show_design)
             st.image(xs.render_png(doc2, width_in=12, dpi=200, max_width_px=1460), width="stretch")
-            c1, c2, c3 = st.columns(3)
+
+            # schedule built from the same SectionResults the drawings use
+            schedule = []
+            for _, r in sel.iterrows():
+                g = xs.station_points(r["Chainage"], ground)
+                if show_design and g is not None and len(g) > 1:
+                    built = str(r.get("Zone", "")).lower().startswith("b")
+                    res = xs.compute_section(r["Chainage"], g, float(r["Design"]), p,
+                                             built_up=built)
+                    schedule.append(xs.section_schedule([res])[0])
+                elif g is not None and len(g):
+                    schedule.append({"chainage": float(r["Chainage"]),
+                                     "shots": int(len(g)),
+                                     "survey_extent": round(float(g["Offset"].max()
+                                                                 - g["Offset"].min()), 3)})
+
+            c1, c2, c3, c4 = st.columns(4)
             c1.download_button("Download DXF (selected)", xs.doc_bytes(doc2), "sections_selected.dxf")
             c2.download_button("Download PNG (selected)", xs.render_png(doc2, width_in=12, dpi=200),
                                "sections_selected.png")
+            c4.download_button("Download schedule (CSV)",
+                               pd.DataFrame(schedule).to_csv(index=False),
+                               "cross_sections.csv")
             if c3.button("Build DXF for ALL stations"):
                 if template:
                     build = xs.station_doc(stations, ground, p, cols=2)
@@ -146,24 +165,36 @@ with tabs["station"]:
             for _, r in sel.iterrows():
                 if template:
                     sec, surveyed, built = xs.station_section(r, ground, p)
-                    rows.append({"Chainage": xs.fmt_chainage(r["Chainage"]),
-                                 "Zone": "Built-up" if built else "Rural",
-                                 "Cut m2": round(sec["cut"], 2), "Fill m2": round(sec["fill"], 2),
-                                 "Surveyed": surveyed})
+                    row = {"Chainage": xs.fmt_chainage(r["Chainage"]),
+                           "Zone": "Built-up" if built else "Rural",
+                           "Cut m2": round(sec["cut"], 2), "Fill m2": round(sec["fill"], 2)}
+                    g = xs.station_points(r["Chainage"], ground)
+                    if g is not None and len(g) >= 2:
+                        res = xs.compute_section(r["Chainage"], g, float(r["Design"]), p,
+                                                 built_up=built)
+                        row["Cut surveyed"] = round(res.surveyed_cut_area, 2)
+                        row["Fill surveyed"] = round(res.surveyed_fill_area, 2)
+                        row["Covered"] = "yes" if res.fully_covered else "no"
+                    else:
+                        row["Cut surveyed"] = None
+                        row["Fill surveyed"] = None
+                        row["Covered"] = "assumed ground"
+                    rows.append(row)
                 else:
                     g = xs.station_points(r["Chainage"], ground)
                     row = {"Chainage": xs.fmt_chainage(r["Chainage"])}
                     if show_design:
                         row["Design CL"] = round(float(r["Design"]), 3)
+                        row["Road width"] = round(xs.formation_width(p), 3)
                     if g is None or not len(g):
-                        row.update({"Shots": 0, "Left (m)": None, "Right (m)": None,
-                                    "Span (m)": None, "Level range (m)": None})
+                        row.update({"Shots": 0, "Survey left": None, "Survey right": None,
+                                    "Survey extent": None, "Level range": None})
                     else:
                         o, l = g["Offset"], g["Level"]
                         row.update({"Shots": len(g),
-                                    "Left (m)": round(min(0.0, o.min()), 2),
-                                    "Right (m)": round(max(0.0, o.max()), 2),
-                                    "Span (m)": round(o.max() - o.min(), 2),
-                                    "Level range (m)": round(l.max() - l.min(), 2)})
+                                    "Survey left": round(min(0.0, o.min()), 2),
+                                    "Survey right": round(max(0.0, o.max()), 2),
+                                    "Survey extent": round(o.max() - o.min(), 2),
+                                    "Level range": round(l.max() - l.min(), 2)})
                     rows.append(row)
             st.dataframe(pd.DataFrame(rows), width="stretch")
